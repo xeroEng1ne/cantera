@@ -2,16 +2,19 @@ import cantera as ct
 import numpy as np
 
 # --- 1. Gas and Inlet Conditions ---
-gas = ct.Solution('drm19.yaml')
-inlet_temp = 300.0
-pressure = ct.one_atm
+# We are using the standard GRI-Mech 3.0 mechanism
+gas = ct.Solution('gri30.yaml')
+
+inlet_temp = 300.0  # K
+pressure = ct.one_atm  # Pa
 equivalence_ratio = 0.65
-inlet_velocity = 0.45
+inlet_velocity = 0.45  # m/s
 
 gas.TP = inlet_temp, pressure
-gas.set_equivalence_ratio(phi=equivalence_ratio, fuel='CH4', oxidizer={'O2': 0.21, 'N2': 0.78, 'AR': 0.01})
+# Set the equivalence ratio using the specific oxidizer composition from the thesis
+gas.set_equivalence_ratio(phi=equivalence_ratio, fuel='CH4', oxidizer={'O2': 0.21, 'N2': 0.78, 'Ar': 0.01})
 
-print("Successfully loaded 'drm19.yaml'.")
+print("Successfully loaded 'gri30.yaml'.")
 print("Initial gas state defined and ready for simulation.")
 print(gas.report())
 
