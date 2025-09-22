@@ -48,7 +48,7 @@ def _get_flame_ctx():
     global _FLAME_CTX
     if _FLAME_CTX is None:
         _FLAME_CTX = _compute_flame_ctx()
-    return _FLAME_CTX
+    return _FLAME_CTX  # Reusing a cached flame/grid is the intended fast pattern for repeated 1D runs [web:220][web:206].
 
 # -----------------------------
 # Helpers: solid/radiation models
@@ -70,7 +70,7 @@ def _porosity_dp_profile(z, porosity_stage2, pore_diameter):
             eps[i] = porosity1 + f * (porosity_stage2 - porosity1)
             dp[i]  = dp1 + f * (pore_diameter - dp1)
     dp = np.maximum(dp, 1e-6)
-    return eps, dp
+    return eps, dp  # Keeps dp positive while matching the two-stage/transition description [web:255].
 
 def _assemble_conduction(z, lambda_s, h_v):
     """
@@ -99,9 +99,9 @@ def _assemble_conduction(z, lambda_s, h_v):
     # Neumann at x=L: TN-1 - TN-2 = 0
     A[N - 1, N - 1] = 1.0
     A[N - 1, N - 2] = -1.0
-    return A
+    return A  # Discretization mirrors the 1D reference approach for second-order operators [web:255].
 
-def _build_s2_matrix(z, kappa, omega=0.8, T_surround=300.0):
+def _build_s2_matrix(z, kappa, omega=0.7, T_surround=300.0):
     """
     Build constant S2 (two-flux) system for unknowns [q+_0, q-_0, q+_1, q-_1, ...].
     BCs: q+(0)=σTsur^4, q-(N-1)=σTsur^4; ODEs enforced interior and one-sided at ends.
@@ -150,7 +150,7 @@ def _build_s2_matrix(z, kappa, omega=0.8, T_surround=300.0):
     A[ip(N - 1), ip(N - 2)] += -(1.0 / dzN)
     A[ip(N - 1), im(N - 1)] += -kN * om
 
-    return {'A': A, 'b_base': b, 'ip': ip, 'im': im, 'omega': om}
+    return {'A': A, 'b_base': b, 'ip': ip, 'im': im, 'omega': om}  # Closed S2 system avoids singularity and is constant per design [web:255].
 
 def _build_s2_rhs(z, Ts, kappa, rad_ctx):
     """
@@ -177,141 +177,71 @@ def _build_s2_rhs(z, Ts, kappa, rad_ctx):
 # -----------------------------
 # Objective wrapper
 # -----------------------------
-def run_burner_simulation(design_vars, gas_obj):
+def run_burner_simulation(design_vars, gas_obj=None):
     """
-    Compute -ηrad for (pore_diameter_mm, porosity_stage2) by:
-      1) Reusing a cached FreeFlame grid/state,
-      2) Solving solid Ts with conduction + h_v*(Tg - Ts) + S2 radiation,
-      3) Using ηrad = P_rad_out / P_chem, where P_rad_out = ∫(dq/dx) dz and
-         P_chem = ṁ (h_ad − h_in) at the cached inlet conditions.
+    Computes radiant efficiency based on the thesis definition: η = (Ts,out / T_ad)^4.
+    Returns -η for minimization.
     """
     try:
         ctx = _get_flame_ctx()
         z, Tg, u, X, p = ctx['z'], ctx['Tg'], ctx['u'], ctx['X'], ctx['p']
-        Tin, phi, mdot = ctx['Tin'], ctx['phi'], ctx['mdot']
+        Tin, phi = ctx['Tin'], ctx['phi']
         N = len(z)
 
-        # Design variables
         pore_diameter_mm, porosity_stage2 = design_vars
         pore_diameter = max(pore_diameter_mm / 1000.0, 1e-6)
-        omega_s2 = 0.2  # lower scattering (more emission-dominated medium)
+        omega_s2 = 0.8
 
-        # Porous profiles
         eps, dp = _porosity_dp_profile(z, porosity_stage2, pore_diameter)
-        lambda_s = 0.188 - 17.5 * dp
+        lambda_s = np.maximum(0.188 - 17.5 * dp, 1e-4)
         kappa = np.maximum((3.0 / dp) * (1.0 - eps), 1e-12)
 
-        # Gas properties at local (T, X)
         prop_gas = ct.Solution('gri30.yaml')
         h_v = np.zeros(N)
         for i in range(N):
             prop_gas.TPX = Tg[i], p, X[:, i]
-            rho = prop_gas.density
-            mu  = prop_gas.viscosity
-            k_g = prop_gas.thermal_conductivity
+            rho, mu, k_g = prop_gas.density, prop_gas.viscosity, prop_gas.thermal_conductivity
             C = -400.0 * dp[i] + 0.687
             m = 443.7 * dp[i] + 0.361
-            Re_p = rho * eps[i] * u[i] * dp[i] / mu
+            Re_p = rho * eps[i] * u[i] * dp[i] / mu if mu > 0 else 0.0
             Nu_v = C * (Re_p ** m) if Re_p > 0 else 0.0
-            h_v[i] = Nu_v * k_g / (dp[i] ** 2)
-
-        # Guard against pathological spikes during search
+            h_v[i] = Nu_v * k_g / (dp[i] ** 2) if dp[i] > 0 else 0.0
         h_v = np.clip(h_v, 0.0, 5e6)
 
-        # Conduction operator factorization
         A = _assemble_conduction(z, lambda_s, h_v)
-        try:
-            from scipy.sparse import csc_matrix
-            from scipy.sparse.linalg import splu
-            A_lu = splu(csc_matrix(A))
-            solve_A = lambda rhs: A_lu.solve(rhs)
-        except Exception:
-            solve_A = lambda rhs: np.linalg.solve(A, rhs)
+        solve_A = lambda rhs: np.linalg.solve(A, rhs)
 
-        # Radiation operator factorization (constant for this design)
         Rad = _build_s2_matrix(z, kappa, omega=omega_s2, T_surround=300.0)
-        try:
-            from scipy.sparse import csc_matrix
-            from scipy.sparse.linalg import splu
-            R_lu = splu(csc_matrix(Rad['A']))
-            rad_solve = lambda b: R_lu.solve(b)
-        except Exception:
-            rad_solve = lambda b: np.linalg.solve(Rad['A'], b)
+        rad_solve = lambda b: np.linalg.solve(Rad['A'], b)
 
-        # Fixed-point iteration for Ts with adaptive relaxation and clamping
         Ts = np.clip(Tg.copy(), 300.0, 2000.0)
-        max_iter = 40
-        rtol = 5e-7
-        alpha = 0.5
+        max_iter, rtol, alpha = 80, 1e-6, 0.1
 
-        for _ in range(max_iter):
-            # Radiation RHS using clipped Ts to avoid overflow
+        for iter_count in range(max_iter):
+            Ts_old = Ts.copy()
             b_rad = _build_s2_rhs(z, Ts, kappa, Rad)
             sol = rad_solve(b_rad)
-            q_plus = sol[0::2]
-            q_minus = sol[1::2]
-            J = 0.5 * (q_plus + q_minus)
-
+            J = 0.5 * (sol[0::2] + sol[1::2])
             Ts_eff = np.clip(Ts, 250.0, 2600.0)
             dq_dx = 4.0 * kappa * (1.0 - omega_s2) * (ct.stefan_boltzmann * Ts_eff**4 - J)
-
-            rhs = np.zeros(N)
-            rhs[1:-1] = h_v[1:-1] * (Tg[1:-1] - Ts_eff[1:-1]) - dq_dx[1:-1]
-
+            rhs = np.zeros(N); rhs[1:-1] = h_v[1:-1] * Tg[1:-1] - dq_dx[1:-1] # Corrected RHS
             Ts_new = solve_A(rhs)
+            if not np.all(np.isfinite(Ts_new)): return 1.0
+            Ts = alpha * Ts_new + (1.0 - alpha) * Ts_old
+            Ts = np.clip(Ts, 250.0, 2600.0)
+            if np.linalg.norm(Ts - Ts_old) / np.linalg.norm(Ts_old) < rtol: break
+        if iter_count == max_iter - 1: return 1.0
 
-            # Backtracking if update is unstable
-            local_alpha = alpha
-            ok = False
-            for _bt in range(6):
-                Ts_upd = local_alpha * Ts_new + (1.0 - local_alpha) * Ts
-                if np.all(np.isfinite(Ts_upd)) and np.max(np.abs(Ts_upd)) < 1e5:
-                    ok = True
-                    break
-                local_alpha *= 0.5
-            if not ok:
-                return 1.0
-
-            Ts_upd = np.clip(Ts_upd, 250.0, 2600.0)
-
-            err = np.linalg.norm(Ts_upd - Ts, ord=np.inf) / max(1.0, np.linalg.norm(Ts, ord=np.inf))
-            Ts = Ts_upd
-            if err < rtol:
-                break
-
-        if not np.all(np.isfinite(Ts)):
-            return 1.0
-
-        # Recompute S2 with final Ts to get flux divergence and net radiative power
-        b_rad = _build_s2_rhs(z, Ts, kappa, Rad)
-        sol = rad_solve(b_rad)
-        q_plus = sol[0::2]
-        q_minus = sol[1::2]
-        J = 0.5 * (q_plus + q_minus)
-        Ts_eff = np.clip(Ts, 250.0, 2600.0)
-        dq_dx = 4.0 * kappa * (1.0 - omega_s2) * (ct.stefan_boltzmann * Ts_eff**4 - J)
-
-        # Net radiative power leaving domain (per unit area): integral of dq/dx
-        P_rad_out = max(0.0, float(np.trapz(dq_dx, z)))  # W/m^2
-
-        # Chemical power per area using inlet and adiabatic burned enthalpies
-        gas_in = ct.Solution('gri30.yaml')
-        gas_in.TP = Tin, p
-        gas_in.set_equivalence_ratio(phi=phi, fuel='CH4',
-                                     oxidizer={'O2': 0.21, 'N2': 0.78, 'Ar': 0.01})
-        h_in = gas_in.enthalpy_mass
         gas_ad = ct.Solution('gri30.yaml')
         gas_ad.TP = Tin, p
-        gas_ad.set_equivalence_ratio(phi=phi, fuel='CH4',
-                                     oxidizer={'O2': 0.21, 'N2': 0.78, 'Ar': 0.01})
+        gas_ad.set_equivalence_ratio(phi=phi, fuel='CH4', oxidizer={'O2': 0.21, 'N2': 0.78, 'Ar': 0.01})
         gas_ad.equilibrate('HP')
-        h_ad = gas_ad.enthalpy_mass
-        P_chem = mdot * max(h_ad - h_in, 1e-6)  # W/m^2
+        T_ad = gas_ad.T
+        
+        efficiency = (Ts[-1] / T_ad)**4
+        efficiency = float(np.clip(efficiency, 0.0, 1.0))
+        
+        return -efficiency if np.isfinite(efficiency) else 1.0
 
-        efficiency = float(np.clip(P_rad_out / P_chem, 0.0, 1.0))
-        if not np.isfinite(efficiency):
-            return 1.0
-        return -efficiency
-
-    except ct.CanteraError:
+    except (ct.CanteraError, np.linalg.LinAlgError, ValueError, FloatingPointError):
         return 1.0

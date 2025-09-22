@@ -1,72 +1,78 @@
-import numpy as np
-import cantera as ct
-from simulation import run_burner_simulation
-from optimizer import RSMOptimizer
+# main.py
 import os
+import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from simulation import run_burner_simulation
+from optimizer import RSMOptimizer
 
 def main():
-    # --- Create Output Directory ---
-    output_dir = 'output'
-    os.makedirs(output_dir, exist_ok=True)
-
-    # --- Optimization Setup ---
-    initial_guess = (1.52, 0.87)          # (pore_diameter_mm, porosity_stage2)
-    bounds = [(0.69, 1.52), (0.865, 0.95)]
-    initial_step = (0.075, 0.01)
-
-    # Preload (unused by simulation, kept for API compatibility)
-    gas = ct.Solution('gri30.yaml')
-
     print("--- Porous Burner Optimization ---")
+    output_dir = 'output'
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # Use initial conditions and bounds from the thesis for 2-D optimization
+    initial_guess = [1.52, 0.87]
+    step_size = [0.075, 0.01] # Initial gamma values from Table 5.3
+    bounds = [[0.69, 1.52], [0.865, 0.95]] # From section 5.3
+
     optimizer = RSMOptimizer(
-        objective_function=run_burner_simulation,
+        objective_fn=run_burner_simulation,
         initial_guess=initial_guess,
-        bounds=bounds,
-        initial_step=initial_step,
-        gas_obj=gas,
-        n_jobs=-1  # parallelize the 9 stencil evaluations; set to 1 to disable
+        step_size=step_size,
+        bounds=bounds
     )
-    print(f"Initial Efficiency: {optimizer.history[0]['f']:.4f}")
 
-    # --- Main Optimization Loop ---
-    max_iterations = 15
-    min_iterations = 6
-    rel_tol = 1e-3
+    print(f"Initial Efficiency: {-optimizer.best_f:.4f}")
 
-    for i in tqdm(range(max_iterations), desc="Main Optimization Loop"):
-        prev_best = optimizer.best_f
-        x_prev = optimizer.x_current.copy()
-        x_new, f_new = optimizer.step()
+    # Main optimization loop with progress bar
+    max_iter = 15
+    with tqdm(total=max_iter, desc="Main Optimization Loop") as pbar:
+        for best_x, best_f in optimizer.optimize(max_iterations=max_iter):
+            pbar.set_postfix(d=f"{best_x[0]:.3f}", eps=f"{best_x[1]:.3f}", eta=f"{-best_f:.4f}")
+            pbar.update(1)
 
-        print(f"\n--- Iteration {i+1} ---")
-        print(f"  Best point so far: d={optimizer.best_x[0]:.4f} mm, ε={optimizer.best_x[1]:.4f}")
-        print(f"  Best efficiency so far: {-optimizer.best_f:.4f}")
-
-        rel_impr = abs(prev_best - optimizer.best_f) / max(1.0, abs(prev_best))
-        if (i + 1) >= min_iterations and rel_impr < rel_tol:
-            print("\nConvergence reached: relative improvement below threshold.")
-            break
-    else:
-        print("\nMax iterations reached.")
-
+    # --- Results ---
+    final_x, final_f = optimizer.best_x, optimizer.best_f
     print("\n--- Optimization Finished ---")
-    print(f"Optimal Design: Pore Diameter = {optimizer.best_x[0]:.4f} mm, Porosity = {optimizer.best_x[1]:.4f}")
-    print(f"Maximum Radiant Efficiency: {-optimizer.best_f:.4f}")
+    print(f"Optimal Design: Pore Diameter = {final_x[0]:.4f} mm, Porosity = {final_x[1]:.4f}")
+    print(f"Maximum Radiant Efficiency: {-final_f:.4f}")
 
-    # --- Plot Optimization History ---
-    iterations = np.arange(len(optimizer.history))
-    efficiencies = [h['f'] for h in optimizer.history]
-    plt.figure()
-    plt.plot(iterations, efficiencies, 'o-', ms=6)
-    plt.xlabel("Iteration")
-    plt.ylabel("Radiant Efficiency")
-    plt.title("Optimization History")
+    # Plotting
+    # The history is a list of tuples (design_vector, objective_value).
+# We unpack it into separate arrays for plotting.
+    history_points = np.array([item[0] for item in optimizer.history])
+    history_f_values = np.array([item[1] for item in optimizer.history])
+
+    iterations = np.arange(len(history_f_values))
+    efficiencies = -history_f_values
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(iterations, efficiencies, 'o-', label='Optimizer Path')
+# Add a line for the best value found
+    plt.axhline(y=-optimizer.best_f, color='r', linestyle='--', label=f'Best Found: {-optimizer.best_f:.4f}')
+    plt.xlabel('Iteration Number')
+    plt.ylabel('Radiant Efficiency (η)')
+    plt.title('Optimization History')
     plt.grid(True)
-    plt.ylim(0, max(1e-3, 1.1 * max(efficiencies)))
-    plt.savefig(os.path.join(output_dir, 'optimization_history.png'), dpi=150)
-    print(f"\nOptimization history plot saved to '{output_dir}/optimization_history.png'")
+    plt.legend()
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, 'optimization_history.png')
+    plt.savefig(plot_path)
+    print(f"\nOptimization history plot saved to '{plot_path}'")
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(iterations, efficiencies, 'o-', label='Optimizer Path')
+    plt.xlabel('Iteration Number')
+    plt.ylabel('Radiant Efficiency (η)')
+    plt.title('Optimization History')
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, 'optimization_history.png')
+    plt.savefig(plot_path)
+    print(f"\nOptimization history plot saved to '{plot_path}'")
 
 if __name__ == "__main__":
     main()
