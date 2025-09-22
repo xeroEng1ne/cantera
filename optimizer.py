@@ -19,6 +19,7 @@ class RSMOptimizer:
 
         self.best_x = self.x.copy()
         self.history = []
+        self.plot_data_history = []
         # Evaluate initial point
         self.best_f = self.fn(self.x)
         if not np.isfinite(self.best_f) or self.best_f >= 0:
@@ -110,6 +111,14 @@ class RSMOptimizer:
 
                 # 2. Fit the quadratic response surface
                 b = self._fit_quadratic_surface(points, f_values)
+                plot_data = {
+                    'iteration' : i+1,
+                    'center_point' : self.x.copy(),
+                    'step_size' : self.step_size.copy(),
+                    'coefficients' : b.copy(),
+                    'bounds' : self.bounds
+                }
+                self.plot_data_history.append(plot_data)
                 
                 # 3. Find the optimal direction on the surface (Newton's step)
                 d = self._find_surface_optimum(b)
@@ -129,7 +138,9 @@ class RSMOptimizer:
                 print(f"  Proposed step: d={x_new[0]:.4f}, ε={x_new[1]:.4f}, η={-f_new:.4f}")
 
                 # 6. Update state and step size
+                is_improvement=False
                 if f_new < self.best_f:
+                    is_improvement=True
                     self.best_f = f_new
                     self.best_x = x_new
                 
@@ -140,11 +151,11 @@ class RSMOptimizer:
                     print("\nConvergence reached: step size below tolerance.")
                     break
                 
-                self.x = x_new
+                self.x = self.best_x.copy()
 
                 # Shrink the trust region if the step was small (interior optimum)
                 # This corresponds to the logic in the C++ version.
-                if scale > 0.99: 
+                if scale > 0.99 or not is_improvement:
                     self.step_size /= 2.0
                     print(f"  Shrinking step size to: [{self.step_size[0]:.4f} {self.step_size[1]:.4f}]")
 
