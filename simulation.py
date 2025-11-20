@@ -1,36 +1,36 @@
-# simulation.py
+# simulation_three_phase_fixed.py
+"""
+Simplified three-phase porous burner with better convergence
+"""
+
 import numpy as np
 import cantera as ct
+from scipy.integrate import solve_bvp
 
-# -----------------------------
-# Cached BurnerFlame and gases
-# -----------------------------
+# ========================================
+# Global cached objects
+# ========================================
 _FLAME = None
-_PROP_GAS = None
-_GAS_AD = None
 _T_AD = None
 
-def _get_prop_gas():
-    global _PROP_GAS
-    if _PROP_GAS is None:
-        _PROP_GAS = ct.Solution('gri30.yaml')
-    return _PROP_GAS
-
 def get_T_ad():
-    global _GAS_AD, _T_AD
+    """Cached adiabatic flame temperature"""
+    global _T_AD
     if _T_AD is None:
-        _GAS_AD = ct.Solution('gri30.yaml')
-        _GAS_AD.TP = 300.0, ct.one_atm
-        _GAS_AD.set_equivalence_ratio(0.65, 'CH4', {'O2': 0.21, 'N2': 0.78, 'AR': 0.01})
-        _GAS_AD.equilibrate('HP')
-        _T_AD = _GAS_AD.T
+        gas = ct.Solution('gri30.yaml')
+        gas.TP = 300.0, ct.one_atm
+        gas.set_equivalence_ratio(0.65, 'CH4', {'O2': 0.21, 'N2': 0.78, 'AR': 0.01})
+        gas.equilibrate('HP')
+        _T_AD = gas.T
     return _T_AD
 
 def _build_adiabatic_flame():
+    """Initial adiabatic flame for starting point"""
     gas = ct.Solution('gri30.yaml')
     Tin, p, phi, uin, width = 300.0, ct.one_atm, 0.65, 0.45, 0.0605
     gas.TP = Tin, p
     gas.set_equivalence_ratio(phi, 'CH4', {'O2': 0.21, 'N2': 0.78, 'AR': 0.01})
+    
     f = ct.BurnerFlame(gas, width=width)
     f.burner.mdot = gas.density * uin
     f.burner.T = Tin
@@ -38,152 +38,250 @@ def _build_adiabatic_flame():
     f.transport_model = 'mixture-averaged'
     f.set_refine_criteria(ratio=3, slope=0.15, curve=0.30)
     f.solve(loglevel=0, auto=True)
+    
     return f
 
 def get_flame():
+    """Get cached flame object"""
     global _FLAME
     if _FLAME is None:
         _FLAME = _build_adiabatic_flame()
     return _FLAME
 
-# -----------------------------
-# Solid phase (S2 + conduction)
-# -----------------------------
-def _porosity_dp_profile(z, eps2, dp2_m):
+
+# ========================================
+# Three-phase porous media profiles
+# ========================================
+
+def _porosity_dp_profile_threephase(z, eps2, dp2_m, eps3, dp3_m):
+    """Three-layer porosity and pore diameter profile"""
     eps1, dp1 = 0.835, 0.00029
-    z0, z1 = 0.033, 0.037
+    z0, z1, z2 = 0.033, 0.037, 0.050
+    
     eps = np.empty_like(z)
     dp = np.empty_like(z)
+    
     for i, x in enumerate(z):
         if x < z0:
             eps[i], dp[i] = eps1, dp1
-        elif x <= z1:
+        elif x < z1:
             f = (x - z0) / (z1 - z0)
             eps[i] = eps1 + f * (eps2 - eps1)
-            dp[i]  = dp1  + f * (dp2_m - dp1)
-        else:
+            dp[i] = dp1 + f * (dp2_m - dp1)
+        elif x < z2:
             eps[i], dp[i] = eps2, dp2_m
+        else:
+            f = min((x - z2) / (0.060 - z2), 1.0)
+            eps[i] = eps2 + f * (eps3 - eps2)
+            dp[i] = dp2_m + f * (dp3_m - dp2_m)
+    
     return eps, np.maximum(dp, 1e-6)
 
-def _assemble_conduction(z, lam_s, h_v):
-    N = len(z)
-    A = np.zeros((N, N))
-    A[0, 0] = 1.0; A[0, 1] = -1.0
-    def hmean(a, b): return 2*a*b/(a+b) if (a+b) != 0.0 else 0.0
-    for i in range(1, N-1):
-        dz_w = z[i] - z[i-1]; dz_e = z[i+1] - z[i]
-        lam_w = hmean(lam_s[i-1], lam_s[i]); lam_e = hmean(lam_s[i], lam_s[i+1])
-        a_w, a_e = lam_w/dz_w, lam_e/dz_e
-        A[i, i-1] = -a_w
-        A[i, i]   = a_w + a_e + h_v[i]
-        A[i, i+1] = -a_e
-    A[N-1, N-1] = 1.0; A[N-1, N-2] = -1.0
-    return A
 
-def _build_s2_matrix(z, kappa, omega=0.7, T_surround=300.0):
-    N = len(z); sigma = ct.stefan_boltzmann; om = float(np.clip(omega, 0.0, 0.999999))
-    kappa = np.maximum(kappa, 1e-12)
-    A = np.zeros((2*N, 2*N)); b = np.zeros(2*N)
-    ip = lambda i: 2*i; im = lambda i: 2*i+1
-    A[ip(0), ip(0)] = 1.0; b[ip(0)] = sigma * T_surround**4
-    A[im(N-1), im(N-1)] = 1.0; b[im(N-1)] = sigma * T_surround**4
-    for i in range(1, N-1):
-        dz = (z[i+1] - z[i-1]); ki = kappa[i]
-        A[ip(i), ip(i-1)] = -1.0/dz; A[ip(i), ip(i+1)] =  1.0/dz
-        A[ip(i), ip(i)]   =  ki*(2.0-om); A[ip(i), im(i)] = -ki*om
-        A[im(i), im(i-1)] = -1.0/dz; A[im(i), im(i+1)] =  1.0/dz
-        A[im(i), ip(i)]   = -ki*om;    A[im(i), im(i)]  =  ki*(2.0-om)
-    dz0, k0 = z[1]-z[0], kappa[0]
-    A[im(0), im(0)] += 1.0/dz0 + k0*(2.0-om); A[im(0), im(1)] += -1.0/dz0; A[im(0), ip(0)] += -k0*om
-    dzN, kN = z[-1]-z[-2], kappa[-1]
-    A[ip(N-1), ip(N-1)] += 1.0/dzN + kN*(2.0-om); A[ip(N-1), ip(N-2)] += -1.0/dzN; A[ip(N-1), im(N-1)] += -kN*om
-    return {'A': A, 'b_base': b, 'ip': ip, 'im': im, 'omega': om}
+# ========================================
+# Simplified sequential three-phase solver
+# ========================================
 
-def _build_s2_rhs(z, Ts, kappa, rad_ctx):
-    sigma = ct.stefan_boltzmann; N = len(z)
-    b = rad_ctx['b_base'].copy(); ip, im = rad_ctx['ip'], rad_ctx['im']; om = rad_ctx['omega']
-    Ts_eff = np.clip(Ts, 250.0, 2600.0)
-    S = 2.0 * kappa * (1.0 - om) * sigma * (Ts_eff**4)
-    b[im(0)] += S[0]
-    for i in range(1, N-1):
-        b[ip(i)] += S[i]; b[im(i)] += S[i]
-    b[ip(N-1)] += S[N-1]
-    return b
-
-def solve_solid_phase(gas_solution_dict, design_vars):
-    z = gas_solution_dict['z']; Tg = gas_solution_dict['T']; u = gas_solution_dict['u']
-    X = gas_solution_dict['X']; p = gas_solution_dict['p']
-    N = len(z)
-    dp2_mm, eps2 = float(design_vars[0]), float(design_vars[1])
-    dp2 = max(dp2_mm/1000.0, 1e-6)
-    eps, dp = _porosity_dp_profile(z, eps2, dp2)
-    lam_s = np.maximum(0.188 - 17.5 * dp, 1e-4)
-    kappa = np.maximum((3.0/dp) * (1.0 - eps), 1e-12)
-
-    prop = _get_prop_gas()
-    h_v = np.zeros(N)
-    for i in range(N):
-        prop.TPX = Tg[i], p, X[:, i]
-        rho = prop.density; mu = prop.viscosity; k_g = prop.thermal_conductivity
-        C = -400.0 * dp[i] + 0.687; m = 443.7 * dp[i] + 0.361
-        Re_p = rho * eps[i] * u[i] * dp[i] / mu if mu > 0 else 0.0
-        Nu_v = C * (Re_p ** m) if Re_p > 0 else 0.0
-        h_v[i] = Nu_v * k_g / (dp[i]**2) if dp[i] > 0 else 0.0
-    h_v = np.clip(h_v, 0.0, 5e6)
-
-    A = _assemble_conduction(z, lam_s, h_v)
-    Rad = _build_s2_matrix(z, kappa, omega=0.7, T_surround=300.0)
-    try:
-        from scipy.sparse import csc_matrix
-        from scipy.sparse.linalg import splu
-        A_lu = splu(csc_matrix(A)); solve_A = lambda rhs: A_lu.solve(rhs)
-        R_lu = splu(csc_matrix(Rad['A'])); rad_solve = lambda b: R_lu.solve(b)
-    except Exception:
-        solve_A = lambda rhs: np.linalg.solve(A, rhs)
-        rad_solve = lambda b: np.linalg.solve(Rad['A'], b)
-
-    Ts = np.clip(Tg.copy(), 300.0, 2000.0)
-    max_iter = 20
-    for it in range(max_iter):
-        Ts_old = Ts.copy()
-        b_rad = _build_s2_rhs(z, Ts, kappa, Rad)
-        sol = rad_solve(b_rad)
-        J = 0.5 * (sol[0::2] + sol[1::2])
-        Ts_eff = np.clip(Ts, 250.0, 2600.0)
-        dq_dx = 4.0 * kappa * (1.0 - Rad['omega']) * (ct.stefan_boltzmann * Ts_eff**4 - J)
-        rhs = np.zeros(N); rhs[1:-1] = h_v[1:-1] * Tg[1:-1] - dq_dx[1:-1]
-        Ts_new = solve_A(rhs)
-        if not np.all(np.isfinite(Ts_new)):
-            return None, None
-        Ts = 0.5 * Ts_new + 0.5 * Ts_old
-        Ts = np.clip(Ts, 250.0, 2600.0)
-        err = np.linalg.norm(Ts - Ts_old, ord=np.inf)/max(1.0, np.linalg.norm(Ts_old, ord=np.inf))
-        if (it >= 8 and err < 2e-6) or err < 5e-7:
-            break
-    return Ts, h_v
-
-# -----------------------------
-# Gas phase with fixed T profile
-# -----------------------------
-def solve_gas_phase(flame_obj, T_target=None, loglevel=0, refine=False):
+class SimplifiedThreePhaseSolver:
     """
-    Update the same BurnerFlame using a fixed temperature profile when T_target is given
-    (energy disabled), else solve normally. Refinement can be disabled for speed.
+    Sequential solver: Gas -> Solid -> Liquid -> iterate
+    Much more stable than fully coupled approach
     """
+    
+    def __init__(self, z, design_vars, gas_solution_dict):
+        self.z = z
+        self.N = len(z)
+        
+        # Extract design variables
+        dp2_mm, eps2, dp3_mm, eps3 = design_vars
+        self.dp2 = max(dp2_mm / 1000.0, 1e-6)
+        self.eps2 = float(eps2)
+        self.dp3 = max(dp3_mm / 1000.0, 1e-6)
+        self.eps3 = float(eps3)
+        
+        # Get profiles
+        self.eps, self.dp = _porosity_dp_profile_threephase(
+            z, self.eps2, self.dp2, self.eps3, self.dp3
+        )
+        
+        # Material properties
+        self.lam_s = np.maximum(0.188 - 17.5 * self.dp, 0.01)
+        self.kappa = np.maximum((3.0 / self.dp) * (1.0 - self.eps), 1e-8)
+        
+        # Gas properties
+        self.Tg_input = gas_solution_dict['T']
+        self.u = gas_solution_dict['u']
+        self.X = gas_solution_dict['X']
+        self.p = gas_solution_dict['p']
+        
+        # Constants
+        self.sigma = ct.stefan_boltzmann
+        self.omega = 0.7
+        self.T_surround = 300.0
+        
+        # Liquid properties
+        self.k_l = 0.6
+        self.h_fg = 2.26e6
+        
+        self.prop = ct.Solution('gri30.yaml')
+    
+    def _compute_h_v(self, Tg):
+        """Volumetric heat transfer coefficient"""
+        h_v = np.zeros(self.N)
+        
+        for i in range(self.N):
+            self.prop.TPX = Tg[i], self.p, self.X[:, i]
+            rho = self.prop.density
+            mu = max(self.prop.viscosity, 1e-8)
+            k_g = self.prop.thermal_conductivity
+            
+            C = -400.0 * self.dp[i] + 0.687
+            m = 443.7 * self.dp[i] + 0.361
+            Re_p = rho * self.eps[i] * self.u[i] * self.dp[i] / mu
+            Nu_v = C * (max(Re_p, 0.1) ** m)
+            h_v[i] = Nu_v * k_g / (self.dp[i]**2)
+        
+        return np.clip(h_v, 1e3, 1e7)
+    
+    def _solve_solid_tridiagonal(self, Tg, Ts_old):
+        """Solve solid phase using tridiagonal system"""
+        Ts = Ts_old.copy()
+        h_v = self._compute_h_v(Tg)
+        
+        # Tridiagonal coefficients
+        a = np.zeros(self.N)
+        b = np.zeros(self.N)
+        c = np.zeros(self.N)
+        d = np.zeros(self.N)
+        
+        # Boundary conditions
+        b[0] = 1.0
+        d[0] = Tg[0]
+        
+        for i in range(1, self.N - 1):
+            dz = self.z[i] - self.z[i-1]
+            dz_next = self.z[i+1] - self.z[i]
+            dz_avg = 0.5 * (dz + dz_next)
+            
+            # Coefficients for d²T/dz²
+            a[i] = self.lam_s[i] / dz**2
+            c[i] = self.lam_s[i] / dz_next**2
+            
+            # Radiation term (linearized)
+            q_rad = 8.0 * self.kappa[i] * (1.0 - self.omega) * self.sigma * Ts[i]**3
+            
+            b[i] = -(a[i] + c[i] + h_v[i] + q_rad)
+            d[i] = -h_v[i] * Tg[i] - 2.0 * self.kappa[i] * (1.0 - self.omega) * self.sigma * self.T_surround**4
+        
+        # Outlet BC (zero gradient)
+        a[-1] = -1.0
+        b[-1] = 1.0
+        d[-1] = 0.0
+        
+        # Solve tridiagonal system
+        Ts_new = self._thomas_algorithm(a, b, c, d)
+        
+        return np.clip(Ts_new, 300, 2400)
+    
+    def _thomas_algorithm(self, a, b, c, d):
+        """Thomas algorithm for tridiagonal system"""
+        n = len(d)
+        c_prime = np.zeros(n)
+        d_prime = np.zeros(n)
+        x = np.zeros(n)
+        
+        c_prime[0] = c[0] / b[0]
+        d_prime[0] = d[0] / b[0]
+        
+        for i in range(1, n):
+            denom = b[i] - a[i] * c_prime[i-1]
+            if abs(denom) < 1e-10:
+                denom = 1e-10
+            c_prime[i] = c[i] / denom
+            d_prime[i] = (d[i] - a[i] * d_prime[i-1]) / denom
+        
+        x[-1] = d_prime[-1]
+        for i in range(n-2, -1, -1):
+            x[i] = d_prime[i] - c_prime[i] * x[i+1]
+        
+        return x
+    
+    def _solve_liquid_simple(self, Tg, Ts):
+        """Simple liquid phase solution"""
+        Tl = np.zeros(self.N)
+        Tl[0] = 300.0  # Inlet
+        
+        for i in range(1, self.N):
+            # Simple forward integration
+            dz = self.z[i] - self.z[i-1]
+            
+            # Heat exchange with gas
+            h_gl = 0.05 * self._compute_h_v(Tg)
+            Q_gl = h_gl[i] * (Tg[i] - Tl[i-1])
+            
+            # Conduction
+            if i > 1:
+                Q_cond = self.k_l * (Tl[i-1] - Tl[i-2]) / dz
+            else:
+                Q_cond = 0.0
+            
+            # Temperature update (explicit)
+            Tl[i] = Tl[i-1] + dz * (Q_gl + Q_cond) / (self.k_l + 1e-6)
+        
+        return np.clip(Tl, 280, 400)
+    
+    def solve(self, max_iter=30, tol=5.0):
+        """Sequential iteration"""
+        Tg = self.Tg_input.copy()
+        Ts = self.Tg_input.copy()
+        Tl = np.ones(self.N) * 300.0
+        
+        for iteration in range(max_iter):
+            Ts_old = Ts.copy()
+            
+            # Solve solid with current gas temperature
+            Ts = self._solve_solid_tridiagonal(Tg, Ts_old)
+            
+            # Solve liquid with current gas/solid
+            Tl = self._solve_liquid_simple(Tg, Ts)
+            
+            # Update gas temperature (weighted average toward solid)
+            Tg = 0.7 * Tg + 0.3 * Ts
+            
+            # Check convergence
+            err = np.linalg.norm(Ts - Ts_old)
+            if err < tol:
+                print(f"    3-phase converged in {iteration+1} iters (err={err:.2f}K)")
+                break
+        
+        return Tg, Ts, Tl
+
+
+# ========================================
+# Gas phase solver
+# ========================================
+
+def solve_gas_phase_threephase(flame_obj, T_target=None, loglevel=0, refine=False):
+    """Update BurnerFlame with fixed temperature profile"""
     f = flame_obj
+    
     if T_target is not None:
         zloc = f.grid / f.grid.max()
         f.flame.set_fixed_temp_profile(zloc, np.asarray(T_target))
         f.energy_enabled = False
     else:
         f.energy_enabled = True
-
+    
     f.transport_model = 'mixture-averaged'
+    
     if refine:
-        f.set_refine_criteria(ratio=3, slope=0.15, curve=0.30)
+        f.set_refine_criteria(ratio=3.0, slope=0.15, curve=0.30)
     else:
-        # Effectively disable refinement during optimization sweeps
-        f.set_refine_criteria(ratio=10, slope=1e9, curve=1e9)
-
-    f.solve(loglevel=loglevel, auto=True)
+        f.set_refine_criteria(ratio=10.0, slope=0.8, curve=0.8, prune=0.0)
+    
+    try:
+        f.solve(loglevel=loglevel, auto=True)
+    except:
+        f.solve(loglevel=0, auto=False)
+    
     return f

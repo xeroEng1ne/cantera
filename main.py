@@ -1,172 +1,182 @@
-# main.py
+# main_three_phase_fixed.py
+"""
+Main driver - simplified and faster
+"""
+
 import os
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-import cantera as ct
 
-from simulation import get_flame, solve_solid_phase, solve_gas_phase, get_T_ad
-from optimizer import RSMOptimizer
+from simulation import (
+    get_flame,
+    SimplifiedThreePhaseSolver,
+    solve_gas_phase_threephase,
+    get_T_ad
+)
 
-def run_coupled_simulation(design_vars):
+
+def run_threephase_simulation(design_vars):
     """
-    Double-loop continuation coupling with speed optimizations:
-      - Subsample solid grid early (stride 4 → 3 → 2),
-      - Fixed-T continuation toward solid: fac in {0.6, 0.8, 1.0} with clamp,
-      - Disabled grid refinement during sweeps,
-      - Thesis metric η = (Ts_out/T_ad)^4 using cached T_ad.
-    Returns negative efficiency for minimization.
+    Simplified three-phase simulation
+    Sequential solver is much more stable
     """
     try:
-        f = get_flame()            # cached BurnerFlame reused across calls
-        max_outer, tolK = 6, 1.5   # K (L2) convergence
-
+        dp2_mm, eps2, dp3_mm, eps3 = design_vars
+        
+        # Validate bounds
+        if not (0.6 < dp2_mm < 1.6 and 0.86 < eps2 < 0.96 and 
+                0.5 < dp3_mm < 1.5 and 0.80 < eps3 < 0.93):
+            return 1.0
+        
+        f = get_flame()
+        
+        # Outer coupling loop (reduced iterations)
+        max_outer = 5
         for outer in range(max_outer):
             Tg_old = f.T.copy()
-
-            # Coarse grid early for speed, finer near convergence
-            stride = 4 if outer < 2 else (3 if outer < 4 else 2)
+            
+            # Subsample for speed
+            stride = 3 if outer < 2 else 2
             idx = np.arange(0, len(f.grid), stride)
-
-            gas_dict_sub = {
+            
+            gas_dict = {
                 'z': f.grid[idx],
                 'T': f.T[idx],
                 'u': f.velocity[idx],
                 'X': f.X[:, idx],
                 'p': f.gas.P
             }
-            Ts_sub, _ = solve_solid_phase(gas_dict_sub, design_vars)
-            if Ts_sub is None:
-                return 1.0
-
-            # Interpolate Ts back to full grid
-            Ts = np.interp(f.grid, gas_dict_sub['z'], Ts_sub)
-
-            # Continuation toward solid with clamped target
-            for fac in (0.6, 0.8, 1.0):
-                Ttarget = np.clip((1.0 - fac) * f.T + fac * Ts, 300.0, 2300.0)
-                f = solve_gas_phase(f, T_target=Ttarget, loglevel=0, refine=False)
-
-            # Relax once with energy enabled (still no refine for speed)
-            f = solve_gas_phase(f, T_target=None, loglevel=0, refine=False)
-
-            if len(Tg_old) == len(f.T):
+            
+            # Solve three-phase system
+            solver = SimplifiedThreePhaseSolver(gas_dict['z'], design_vars, gas_dict)
+            Tg_sub, Ts_sub, Tl_sub = solver.solve()
+            
+            # Interpolate back
+            Ts_full = np.interp(f.grid, gas_dict['z'], Ts_sub)
+            
+            # Continuation
+            for fac in [0.5, 0.8, 1.0]:
+                Ttarget = np.clip((1-fac)*f.T + fac*Ts_full, 300, 2200)
+                f = solve_gas_phase_threephase(f, T_target=Ttarget, loglevel=0, refine=False)
+            
+            # Convergence check
+            if len(f.T) == len(Tg_old):
                 err = np.linalg.norm(f.T - Tg_old)
-                if err < tolK:
+                if err < 3.0:
                     break
-
-        # Final solid on full grid for η
-        gas_dict_full = {
+        
+        # Final solution
+        gas_dict_final = {
             'z': f.grid,
             'T': f.T,
             'u': f.velocity,
             'X': f.X,
             'p': f.gas.P
         }
-        Ts_final, _ = solve_solid_phase(gas_dict_full, design_vars)
-        if Ts_final is None:
+        
+        solver_final = SimplifiedThreePhaseSolver(f.grid, design_vars, gas_dict_final)
+        _, Ts_final, _ = solver_final.solve()
+        
+        # Efficiency
+        T_ad = get_T_ad()
+        Ts_out = Ts_final[-1]
+        
+        if not (600 < Ts_out < 2300):
             return 1.0
-
-        T_ad = get_T_ad()  # cached adiabatic reference
-        eta = (Ts_final[-1] / T_ad)**4
-        return -eta if np.isfinite(eta) else 1.0
-
-    except ct.CanteraError:
+        
+        eta = (Ts_out / T_ad) ** 4
+        
+        if not np.isfinite(eta) or eta <= 0:
+            return 1.0
+        
+        print(f"  ✓ Ts_out={Ts_out:.0f}K, η={eta:.4f} | dp2={dp2_mm:.2f}, ε2={eps2:.3f}, dp3={dp3_mm:.2f}, ε3={eps3:.3f}")
+        return -eta
+        
+    except Exception as e:
+        print(f"  ✗ Error: {e}")
         return 1.0
 
-def plot_response_surfaces(plot_data_history, output_dir):
-    """Generates and saves contour plots of the quadratic response surface."""
-    if not plot_data_history:
-        print("No data available to plot response surfaces.")
-        return
 
-    os.makedirs(output_dir, exist_ok=True)
-    print(f"\n--- Generating {len(plot_data_history)} Response Surface Plots ---")
+def simple_grid_search():
+    """
+    Simple grid search instead of complex RSM
+    Much faster and more reliable
+    """
+    print("Starting 3-Phase Grid Search Optimization\n")
+    
+    # Coarse grid
+    dp2_range = np.linspace(0.8, 1.5, 5)
+    eps2_range = np.linspace(0.87, 0.94, 4)
+    dp3_range = np.linspace(0.7, 1.3, 5)
+    eps3_range = np.linspace(0.82, 0.90, 4)
+    
+    best_eta = -1.0
+    best_design = None
+    results = []
+    
+    total = len(dp2_range) * len(eps2_range) * len(dp3_range) * len(eps3_range)
+    
+    with tqdm(total=total, desc="Grid Search") as pbar:
+        for dp2 in dp2_range:
+            for eps2 in eps2_range:
+                for dp3 in dp3_range:
+                    for eps3 in eps3_range:
+                        design = [dp2, eps2, dp3, eps3]
+                        eta_neg = run_threephase_simulation(design)
+                        eta = -eta_neg
+                        
+                        results.append((design, eta))
+                        
+                        if eta > best_eta and eta < 1.5:
+                            best_eta = eta
+                            best_design = design
+                        
+                        pbar.update(1)
+                        pbar.set_postfix(best_η=f"{best_eta:.4f}")
+    
+    return best_design, best_eta, results
 
-    for data in plot_data_history:
-        iteration   = data['iteration']
-        center      = data['center_point']
-        step        = data['step_size']
-        b           = data['coefficients']
-        bounds      = data['bounds']
-
-        if len(b) < 6:
-            print(f"Skipping plot for iteration {iteration}: insufficient coefficients.")
-            continue
-
-        x_range = np.linspace(bounds['x_min'], bounds['x_max'], 150)
-        y_range = np.linspace(bounds['y_min'], bounds['y_max'], 150)
-        X, Y = np.meshgrid(x_range, y_range)
-        Z = b[0] + b[1]*X + b[2]*Y + b[3]*X**2 + b[4]*Y**2 + b[5]*X*Y
-
-        fig, ax = plt.subplots(figsize=(8, 7))
-        csf = ax.contourf(X, Y, -Z, levels=40, cmap='viridis')
-        ax.contour(X, Y, -Z, levels=40, colors='black', linewidths=0.4)
-        rect = plt.Rectangle((center[0]-step[0], center[1]-step[1]),
-                             2*step[0], 2*step[1],
-                             fill=False, edgecolor='white', linewidth=1.5)
-        ax.add_patch(rect)
-        ax.plot(center[0], center[1], 'w.', markersize=8)
-        ax.set_xlabel(r'Pore Diameter, $d_{p,2}$ (mm)')
-        ax.set_ylabel(r'Porosity, $\epsilon_2$')
-        ax.set_title(f'Response Surface (Iteration {iteration})')
-        ax.set_xlim(bounds['x_min'], bounds['x_max'])
-        ax.set_ylim(bounds['y_min'], bounds['y_max'])
-        cbar = fig.colorbar(csf, ax=ax); cbar.set_label('Predicted Efficiency')
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, f'response_surface_iter_{iteration:02d}.png'), dpi=150)
-        plt.close(fig)
 
 def main():
-    """Main driver for the optimization and plotting."""
-    # Prevent thread oversubscription with process pool
-    os.environ.setdefault('OMP_NUM_THREADS', '1')
-    os.environ.setdefault('MKL_NUM_THREADS', '1')
-
-    output_dir = 'output_double_coupled'
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Design variables: (pore_diameter_mm, porosity_stage2)
-    initial_guess = [1.445, 0.88]
-    step_size     = [0.075, 0.01]
-    bounds        = [[0.69, 1.52], [0.865, 0.95]]
-
-    optimizer = RSMOptimizer(
-        objective_fn=run_coupled_simulation,
-        initial_guess=initial_guess,
-        step_size=step_size,
-        bounds=bounds
-    )
-    print(f"Initial Radiant Efficiency: {-optimizer.best_f:.4f}")
-
-    max_iter = 10
-    with tqdm(total=max_iter, desc="Main Optimization Loop") as pbar:
-        for best_x, best_f in optimizer.optimize(max_iterations=max_iter):
-            pbar.set_postfix(d=f"{best_x[0]:.3f}",
-                             eps=f"{best_x[1]:.3f}",
-                             eta=f"{-best_f:.4f}")
-            pbar.update(1)
-
-    final_x, final_f = optimizer.best_x, optimizer.best_f
-    print("\n--- Optimization Finished ---")
-    print(f"Optimal Design: Pore Diameter = {final_x[0]:.4f} mm, Porosity = {final_x[1]:.4f}")
-    print(f"Maximum Radiant Efficiency: {-final_f:.4f}")
-
-    # Plot Best-So-Far Efficiency
-    history_f = np.array([item[1] for item in optimizer.history])
-    best_f = np.minimum.accumulate(history_f)
-    plt.figure(figsize=(10, 6))
-    plt.plot(np.arange(len(best_f)), -best_f, 'o-')
-    plt.xlabel('Iteration Number')
-    plt.ylabel('Radiant Efficiency (η)')
-    plt.title('Optimization Progress (Best-So-Far)')
-    plt.grid(True)
+    """Main optimization"""
+    os.makedirs('output_three_phase_simple', exist_ok=True)
+    
+    best_design, best_eta, results = simple_grid_search()
+    
+    print("\n" + "="*60)
+    print("OPTIMIZATION COMPLETE")
+    print("="*60)
+    
+    if best_design is not None:
+        print(f"Optimal Design:")
+        print(f"  Layer 2: dp={best_design[0]:.3f} mm, ε={best_design[1]:.4f}")
+        print(f"  Layer 3: dp={best_design[2]:.3f} mm, ε={best_design[3]:.4f}")
+        print(f"Maximum Efficiency: η = {best_eta:.4f}")
+    else:
+        print("No valid solution found!")
+    
+    print("="*60)
+    
+    # Save results
+    np.save('output_three_phase_simple/results.npy', results)
+    
+    # Plot top 20 designs
+    results_sorted = sorted(results, key=lambda x: x[1], reverse=True)[:20]
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    etas = [r[1] for r in results_sorted]
+    ax.bar(range(len(etas)), etas)
+    ax.set_xlabel('Design Rank')
+    ax.set_ylabel('Efficiency η')
+    ax.set_title('Top 20 Designs')
+    ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'optimization_best_history.png'), dpi=150)
+    plt.savefig('output_three_phase_simple/top_designs.png', dpi=150)
     plt.close()
+    
+    print(f"\nResults saved to: output_three_phase_simple/")
 
-    # Plot response-surface contours
-    plot_response_surfaces(optimizer.plot_data_history, output_dir)
 
 if __name__ == "__main__":
     main()
