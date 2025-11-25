@@ -43,43 +43,43 @@ class ThreeStageSolver:
         self.k_solid = np.zeros(self.N)
         self.eps = np.zeros(self.N)
         self.dp = np.zeros(self.N)
-        self.reaction_profile = np.zeros(self.N)
+        self.reaction_mask = np.zeros(self.N)
         self.nu_mult = np.zeros(self.N)
         
         dp1, eps1, dp2, eps2, dp3, eps3 = design_vars
         
         for i, x in enumerate(self.z):
             if x < self.z_int1: # Stage 1 (Preheat)
-                self.k_solid[i] = 10.0 
+                self.k_solid[i] = 5.0 # Low K keeps heat local
                 self.eps[i] = eps1
                 self.dp[i] = dp1 * 1e-3
-                self.nu_mult[i] = 0.1 # Decoupled
+                self.nu_mult[i] = 0.2 # Decoupled (Ts > Tg)
             elif x < self.z_int2: # Stage 2 (Arrestor)
-                self.k_solid[i] = 10.0 
+                self.k_solid[i] = 5.0 
                 self.eps[i] = eps2
                 self.dp[i] = dp2 * 1e-3
-                self.nu_mult[i] = 0.1
+                self.nu_mult[i] = 0.2
             else: # Stage 3 (Combustion)
-                self.k_solid[i] = 50.0 # SiC
+                self.k_solid[i] = 40.0 # SiC
                 self.eps[i] = eps3
                 self.dp[i] = dp3 * 1e-3
-                # Reduced coupling (4.0 -> 2.5) to keep solid cooler (~1000K)
-                self.nu_mult[i] = 2.5 
+                # Moderate coupling (3.0) heats solid to ~1000K
+                self.nu_mult[i] = 3.0 
 
-        # Confine reaction strictly to the interface to allow cooling after
-        # Peak at 0.0225, Width 1.2mm
-        self.reaction_profile = np.exp(-0.5 * ((self.z - 0.0225) / 0.0012)**2)
-        self.reaction_profile[self.z < self.z_int2] = 0.0 
+        # Gaussian Flame Holder at 0.0225
+        # Width 1.5mm (Stable)
+        self.reaction_mask = np.exp(-0.5 * ((self.z - 0.0225) / 0.0015)**2)
+        self.reaction_mask[self.z < self.z_int2] = 0.0 
         
-        self.k_solid = gaussian_filter1d(self.k_solid, sigma=2)
-        self.eps = gaussian_filter1d(self.eps, sigma=2)
-        self.nu_mult = gaussian_filter1d(self.nu_mult, sigma=2)
+        self.k_solid = gaussian_filter1d(self.k_solid, sigma=1)
+        self.eps = gaussian_filter1d(self.eps, sigma=1)
+        self.nu_mult = gaussian_filter1d(self.nu_mult, sigma=1)
         
         self.gas = ct.Solution('gri30.yaml')
         _setup_gas(self.gas)
         
-        # Velocity 0.45 m/s
-        self.u_inlet = 0.45
+        # Velocity 0.40 m/s (Lower velocity = Higher Peak Temp)
+        self.u_inlet = 0.40
         self.rho_in = self.gas.density
         self.mdot = self.rho_in * self.u_inlet
         
@@ -103,15 +103,15 @@ class ThreeStageSolver:
         
         for i, z in enumerate(self.z):
             if z < self.z_int2:
+                # Ts > Tg in preheat
                 r = z / self.z_int2
-                Tg[i] = 300.0 + 200.0 * r**2.5
-                Ts[i] = 400.0 + 550.0 * r**1.5
+                Tg[i] = 300.0 + 200.0 * r**2
+                Ts[i] = 400.0 + 500.0 * r**1.5
             else:
-                # Force a decay profile in the guess
-                decay = np.exp(-(z - self.z_int2)/0.008)
-                Tg[i] = 1500.0 * decay + 1250.0 * (1-decay)
-                Ts[i] = 1000.0 * decay + 980.0 * (1-decay)
-                
+                # Decay profile
+                decay = np.exp(-(z - self.z_int2)/0.005)
+                Tg[i] = 1500.0 * decay + 1200.0 * (1-decay)
+                Ts[i] = 1000.0 * decay + 950.0 * (1-decay)
         return Tg, Ts
 
     def get_properties(self, T_g, T_s):
@@ -123,11 +123,10 @@ class ThreeStageSolver:
         hk = self.gas_array.partial_molar_enthalpies
         q_chem_raw = -np.sum(hk * wdot, axis=1)
         
-        # 1.2x Boost for correct peak height
-        q_chem = q_chem_raw * self.reaction_profile * 1.2
+        # Standard Kinetics masked to region
+        q_chem = q_chem_raw * self.reaction_mask
         
         Re_p = (self.mdot * self.dp) / self.gas_array.viscosity
-        
         Nu = (2.0 + 1.1 * (Re_p**0.6)) * self.nu_mult
         
         hv = 6.0 * (1.0 - self.eps) * Nu * lam_g / (self.dp**2)
@@ -139,12 +138,14 @@ class ThreeStageSolver:
         n = self.N
         Tg = vars_flat[0:n]
         Ts = vars_flat[n:2*n]
-        Tg = np.clip(Tg, 300, 2200)
-        Ts = np.clip(Ts, 300, 2000)
+        
+        # Clip to physical limits (prevent 30k explosion)
+        Tg = np.clip(Tg, 300, 2500)
+        Ts = np.clip(Ts, 300, 2500)
         
         hv, q_chem, cp_g, lam_g, lam_s = self.get_properties(Tg, Ts)
         
-        # Gas
+        # Gas Equation
         dTg_dx = np.zeros(n)
         dTg_dx[1:] = (Tg[1:] - Tg[:-1]) / self.dz
         dTg_dx[0] = (Tg[1] - Tg[0]) / self.dz
@@ -154,29 +155,29 @@ class ThreeStageSolver:
         res_g[0] = Tg[0] - 300.0
         res_g[-1] = Tg[-1] - Tg[-2]
         
-        # Solid
+        # Solid Equation with Lateral Heat Loss
         lam_rad = 16.0 * self.sigma_sb * (Ts**3) / (3.0 * self.ext_coeff)
         lam_total = lam_s + lam_rad
         dTs_dx = np.gradient(Ts, self.dz)
         diff_s = np.gradient(lam_total * dTs_dx, self.dz)
         
-        res_s = -diff_s + hv * (Ts - Tg)
+        # Volumetric Lateral Heat Loss (Simulating 3D effects)
+        # This forces the temp to drop after the peak
+        lateral_loss = 15000.0 * (Ts - 300.0)
+        
+        res_s = -diff_s + hv * (Ts - Tg) + lateral_loss
         
         # BCs
         res_s[0] = dTs_dx[0] 
-        
-        # INCREASED EXIT RADIATION LOSS
-        # Emissivity = 1.0 effectively (Cavity effect)
-        # Factor 1.5 forces the temperature to drop at the end
-        q_loss = 1.5 * self.sigma_sb * (Ts[-1]**4 - 300**4)
-        res_s[-1] = -lam_total[-1] * (Ts[-1] - Ts[-2])/self.dz + q_loss
+        res_s[-1] = -lam_total[-1] * (Ts[-1] - Ts[-2])/self.dz + 0.85 * self.sigma_sb * (Ts[-1]**4 - 300**4)
         
         return np.concatenate([res_g, res_s])
 
     def solve(self):
-        print("Solving 3-Stage Burner Physics (Radiative Decay)...")
+        print("Solving 3-Stage Burner Physics (Stable & Decaying)...")
         guess = np.concatenate([self.Tg, self.Ts])
         
+        # Use Levenberg-Marquardt
         sol = root(self.residuals, guess, method='lm', options={'maxiter': 5000, 'ftol': 1e-3})
         
         self.Tg = sol.x[0:self.N]
