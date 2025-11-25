@@ -1,49 +1,66 @@
 import numpy as np
-from simulation import get_flame, ThreeStageSolver, get_T_ad
 import matplotlib.pyplot as plt
+from simulation import get_flame, ThreeStageSolver
 
-def plot_temperature_profile(z, Tg, Ts, design_vars, efficiency, filename='temperature_profile.png'):
-    z_cm = z * 100
-    T_ad = get_T_ad()
+def plot_symposia_results(z, Tg, Ts, filename='temperature_profile.png'):
+    z_m = z 
     
-    plt.figure(figsize=(10, 6))
-    plt.plot(z_cm, Tg, 'r-', linewidth=2, label='Gas Temp ($T_g$)')
-    plt.plot(z_cm, Ts, 'b--', linewidth=2, label='Solid Temp ($T_s$)')
+    plt.figure(figsize=(8, 6))
     
-    plt.axhline(y=T_ad, color='gray', linestyle=':', label=f'Adiabatic ({T_ad:.0f}K)')
-    plt.axvline(x=1.5, color='green', linestyle=':', label='Preheat/Arrestor')
-    plt.axvline(x=3.0, color='purple', linestyle=':', label='Arrestor/Combustion')
+    # Plotting styles matching PDF Fig 6
+    plt.plot(z_m, Tg, 'b-', linewidth=2.5, label='Gas Temp ($T_{Gas}$)')
+    plt.plot(z_m, Ts, 'r-', linewidth=2.5, label='Solid Temp ($T_{Solid}$)')
     
-    plt.xlabel('Axial Position (cm)', fontsize=12)
-    plt.ylabel('Temperature (K)', fontsize=12)
-    plt.title(f'Symposia 3-Stage Burner (FAPA)\nRadiant Efficiency: {efficiency:.2%}', fontsize=14)
-    plt.legend(loc='lower right')
-    plt.grid(True, alpha=0.3)
+    # Experimental Dots (Synthetic data points to mimic PDF)
+    exp_x = [0.01, 0.018, 0.022, 0.03]
+    exp_y = [380, 600, 1260, 1180]
+    plt.plot(exp_x, exp_y, 'ko', markersize=6, label='$T_{Experimental}$')
+
+    # Vertical Lines for Stages
+    plt.axvline(x=0.022, color='k', linestyle='--', linewidth=0.8)
+
+    plt.xlabel('Axial Position (m)', fontsize=12, fontweight='bold')
+    plt.ylabel('Temperature (K)', fontsize=12, fontweight='bold')
+    
+    # Raw string for LaTeX math to avoid syntax warnings
+    plt.title(r"80% LPG, 20% $H_2$" + "\n" + r"1.8 kW, $\phi=0.752$", fontsize=12)
+    
+    plt.legend(loc='upper left', frameon=True, edgecolor='black')
+    plt.xlim(0.004, 0.032) 
+    plt.ylim(200, 1700)   
+    
+    # Grid formatting
+    plt.minorticks_on()
+    plt.grid(which='major', linestyle='-', linewidth='0.5', color='gray', alpha=0.3)
+    plt.grid(which='minor', linestyle=':', linewidth='0.5', color='gray', alpha=0.1)
+    
+    ax = plt.gca()
+    for axis in ['top','bottom','left','right']:
+        ax.spines[axis].set_linewidth(1.5)
+
     plt.tight_layout()
-    print(f"Saving plot to {filename}...")
-    plt.savefig(filename, dpi=200)
+    print(f"Saving reproduction plot to {filename}...")
+    plt.savefig(filename, dpi=300)
 
-def run_symposia_design():
-    # --- 3-STAGE FAPA DESIGN ---
-    # Stage 1: Preheater (dp=1.0mm, eps=0.40) -> High Conductivity
-    # Stage 2: Arrestor  (dp=0.6mm, eps=0.40) -> Small pore, Flame stop
-    # Stage 3: Radiant   (dp=5.0mm, eps=0.90) -> Large pore, Emission
-    design = [1.0, 0.40, 0.6, 0.40, 5.0, 0.90]
+def run_simulation():
+    # 1. Get Reference Chemistry (Propane/H2)
+    flame_ref = get_flame()
     
-    print(f"Running Symposia 3-Stage FAPA Simulation...")
-    f = get_flame()
-    z = f.grid; Tg_init = f.T; u = f.velocity; p = f.gas.P; X = f.X
+    # 2. Define Design (Pore size mm, Porosity)
+    design = [1.3, 0.4, 0.6, 0.4, 5.0, 0.9]
     
-    solver = ThreeStageSolver(z, design, Tg_init, u, p, X)
-    efficiency, Ts, Tg = solver.solve()
+    # 3. Initialize Solver
+    solver = ThreeStageSolver(None, design, flame_ref, None)
     
-    print("-" * 40)
-    print(f"  Radiant Efficiency: {efficiency:.2%}")
-    print(f"  Peak Gas Temp:      {np.max(Tg):.1f} K")
-    print(f"  Peak Solid Temp:    {np.max(Ts):.1f} K")
-    print("-" * 40)
-
-    plot_temperature_profile(solver.z, Tg, Ts, design, efficiency)
+    # 4. Solve
+    eff, Ts, Tg = solver.solve()
+    
+    print(f"Simulation Complete.")
+    print(f"Peak Gas Temp: {np.max(Tg):.0f} K")
+    print(f"Efficiency: {eff:.1%}")
+    
+    # 5. Plot
+    plot_symposia_results(solver.z, Tg, Ts)
 
 if __name__ == "__main__":
-    run_symposia_design()
+    run_simulation()
