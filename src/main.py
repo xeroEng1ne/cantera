@@ -10,13 +10,16 @@ def plot_symposia_results(z, Tg, Ts, filename='temperature_profile.png'):
     
     plt.figure(figsize=(8, 6))
     
+    # Plot lines
     plt.plot(z, Tg, 'b-', linewidth=2.5, label='Gas Temp ($T_{Gas}$)')
     plt.plot(z, Ts, 'r-', linewidth=2.5, label='Solid Temp ($T_{Solid}$)')
     
+    # Experimental Dots
     exp_x = [0.01, 0.018, 0.022, 0.03]
     exp_y = [380, 600, 1260, 1180]
     plt.plot(exp_x, exp_y, 'ko', markersize=7, label='$T_{Experimental}$')
 
+    # Vertical Line
     plt.axvline(x=0.022, color='k', linestyle='--', linewidth=0.8)
 
     plt.xlabel('Axial Position (m)', fontsize=12, fontweight='bold')
