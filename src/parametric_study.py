@@ -35,7 +35,7 @@ def plot_sweep(results, param_name, filename):
     plt.legend(loc='upper left', frameon=True, fancybox=False, fontsize=10, ncol=2)
     
     plt.grid(True, which='both', linestyle='--', alpha=0.3)
-    plt.xlim(0.004, 0.035)
+    plt.xlim(0.004, 0.03)
     plt.ylim(200, 1800)
     
     plt.tight_layout()
