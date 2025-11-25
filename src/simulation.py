@@ -33,7 +33,7 @@ def get_flame():
 class ThreeStageSolver:
     def __init__(self, z_grid, design_vars, X_ref, Tg_ref):
         self.L_total = 0.035
-        self.N = 350
+        self.N = 400
         self.z = np.linspace(0, self.L_total, self.N)
         self.dz = self.z[1] - self.z[0]
         
@@ -45,40 +45,44 @@ class ThreeStageSolver:
         self.dp = np.zeros(self.N)
         self.reaction_mask = np.zeros(self.N)
         self.nu_mult = np.zeros(self.N)
+        self.loss_coeff = np.zeros(self.N)
         
         dp1, eps1, dp2, eps2, dp3, eps3 = design_vars
         
         for i, x in enumerate(self.z):
             if x < self.z_int1: # Stage 1 (Preheat)
-                self.k_solid[i] = 10.0 
+                self.k_solid[i] = 12.0 
                 self.eps[i] = eps1
                 self.dp[i] = dp1 * 1e-3
-                # Low coupling keeps Solid > Gas
                 self.nu_mult[i] = 0.01 
+                self.loss_coeff[i] = 5000.0 # Low loss in preheat
             elif x < self.z_int2: # Stage 2 (Arrestor)
-                self.k_solid[i] = 10.0 
+                self.k_solid[i] = 12.0 
                 self.eps[i] = eps2
                 self.dp[i] = dp2 * 1e-3
                 self.nu_mult[i] = 0.01
+                self.loss_coeff[i] = 5000.0
             else: # Stage 3 (Combustion)
-                self.k_solid[i] = 60.0 # SiC
+                self.k_solid[i] = 50.0 
                 self.eps[i] = eps3
                 self.dp[i] = dp3 * 1e-3
-                # Strong Coupling: 10x to pull Solid Temp up to 1000K
-                self.nu_mult[i] = 10.0 
+                self.nu_mult[i] = 8.0 
+                # High Loss downstream to force decay
+                self.loss_coeff[i] = 40000.0 
 
-        # Gaussian Flame Holder at 0.0225
+        # Flame Holder at 0.0225
         self.reaction_mask = np.exp(-0.5 * ((self.z - 0.0225) / 0.0012)**2)
         self.reaction_mask[self.z < self.z_int2] = 0.0 
         
-        self.k_solid = gaussian_filter1d(self.k_solid, sigma=1)
-        self.eps = gaussian_filter1d(self.eps, sigma=1)
-        self.nu_mult = gaussian_filter1d(self.nu_mult, sigma=1)
+        # SMOOTHING: Essential to prevent "ripples" in the solid curve
+        self.k_solid = gaussian_filter1d(self.k_solid, sigma=3)
+        self.eps = gaussian_filter1d(self.eps, sigma=3)
+        self.nu_mult = gaussian_filter1d(self.nu_mult, sigma=3)
+        self.loss_coeff = gaussian_filter1d(self.loss_coeff, sigma=5) # Very smooth loss transition
         
         self.gas = ct.Solution('gri30.yaml')
         _setup_gas(self.gas)
         
-        # Velocity: 0.45 m/s (Stable anchor)
         self.u_inlet = 0.45
         self.rho_in = self.gas.density
         self.mdot = self.rho_in * self.u_inlet
@@ -104,12 +108,12 @@ class ThreeStageSolver:
         for i, z in enumerate(self.z):
             if z < self.z_int2:
                 r = z / self.z_int2
-                Tg[i] = 300.0 + 250.0 * r**2
-                Ts[i] = 400.0 + 550.0 * r**1.5
+                Tg[i] = 200.0 + 200.0 * r**3 
+                Ts[i] = 400.0 + 600.0 * r**1.5 
             else:
-                decay = np.exp(-(z - self.z_int2)/0.006)
-                Tg[i] = 1600.0 * decay + 1250.0 * (1-decay)
-                Ts[i] = 1050.0 * decay + 950.0 * (1-decay)
+                decay = np.exp(-(z - self.z_int2)/0.005)
+                Tg[i] = 1500.0 * decay + 1000.0 * (1-decay)
+                Ts[i] = 1000.0 * decay + 800.0 * (1-decay)
         return Tg, Ts
 
     def get_properties(self, T_g, T_s):
@@ -121,9 +125,8 @@ class ThreeStageSolver:
         hk = self.gas_array.partial_molar_enthalpies
         q_chem_raw = -np.sum(hk * wdot, axis=1)
         
-        # TURBULENCE FACTOR:
-        # Accounts for 3D pore mixing intensity.
-        q_chem = q_chem_raw * self.reaction_mask * 5
+        # Turbulence Factor 5.0
+        q_chem = q_chem_raw * self.reaction_mask * 5.0
         
         Re_p = (self.mdot * self.dp) / self.gas_array.viscosity
         Nu = (2.0 + 1.1 * (Re_p**0.6)) * self.nu_mult
@@ -138,8 +141,8 @@ class ThreeStageSolver:
         Tg = vars_flat[0:n]
         Ts = vars_flat[n:2*n]
         
-        Tg = np.clip(Tg, 300, 2800)
-        Ts = np.clip(Ts, 300, 2800)
+        Tg = np.clip(Tg, 200, 2800)
+        Ts = np.clip(Ts, 200, 2800)
         
         hv, q_chem, cp_g, lam_g, lam_s = self.get_properties(Tg, Ts)
         
@@ -150,7 +153,7 @@ class ThreeStageSolver:
         d2Tg_dx2 = np.gradient(np.gradient(Tg, self.dz), self.dz)
         
         res_g = self.mdot * cp_g * dTg_dx - (lam_g * d2Tg_dx2) - hv * (Ts - Tg) - (self.eps * q_chem)
-        res_g[0] = Tg[0] - 300.0
+        res_g[0] = Tg[0] - 300.0 # Inlet Gas Fixed
         res_g[-1] = Tg[-1] - Tg[-2]
         
         # Solid
@@ -159,18 +162,19 @@ class ThreeStageSolver:
         dTs_dx = np.gradient(Ts, self.dz)
         diff_s = np.gradient(lam_total * dTs_dx, self.dz)
         
-        # Volumetric Lateral Loss (Tuned to bend the curve down)
-        lateral_loss = 25000.0 * (Ts - 300.0)
+        # Smoothed Lateral Loss
+        lateral_loss = self.loss_coeff * (Ts - 300.0)
         
         res_s = -diff_s + hv * (Ts - Tg) + lateral_loss
         
+        # Floating Inlet (Flux = 0) allows smooth start without kinks
         res_s[0] = dTs_dx[0] 
         res_s[-1] = -lam_total[-1] * (Ts[-1] - Ts[-2])/self.dz + 0.85 * self.sigma_sb * (Ts[-1]**4 - 300**4)
         
         return np.concatenate([res_g, res_s])
 
     def solve(self):
-        print("Solving 3-Stage Burner Physics (Turbulence Corrected)...")
+        print("Solving 3-Stage Burner Physics (Smoothed Decay)...")
         guess = np.concatenate([self.Tg, self.Ts])
         
         sol = root(self.residuals, guess, method='lm', options={'maxiter': 8000, 'ftol': 1e-3})
