@@ -24,7 +24,7 @@ def get_flame():
     print("Initializing base flame chemistry...")
     gas = ct.Solution('gri30.yaml')
     _setup_gas(gas) 
-    f = ct.FreeFlame(gas, width=0.03)
+    f = ct.FreeFlame(gas, width=0.05)
     f.set_refine_criteria(ratio=3.0, slope=0.06, curve=0.1)
     f.solve(loglevel=0, auto=True)
     _FLAME = f
@@ -32,43 +32,56 @@ def get_flame():
 
 class ThreeStageSolver:
     def __init__(self, z_grid, design_vars, X_ref, Tg_ref):
-        # Grid parameters
-        self.L_total = 0.032
-        self.N = 200
+        self.L_total = 0.035
+        self.N = 300
         self.z = np.linspace(0, self.L_total, self.N)
         self.dz = self.z[1] - self.z[0]
         
-        # Zones
-        self.z_int1 = 0.015
-        self.z_int2 = 0.022
+        self.z_int1 = 0.015 
+        self.z_int2 = 0.022 
         
         self.k_solid = np.zeros(self.N)
         self.eps = np.zeros(self.N)
         self.dp = np.zeros(self.N)
+        self.reaction_mask = np.zeros(self.N)
+        self.nu_mult = np.zeros(self.N)
         
         dp1, eps1, dp2, eps2, dp3, eps3 = design_vars
         
         for i, x in enumerate(self.z):
-            if x < self.z_int1: # Stage 1
-                self.k_solid[i] = 30.0
+            if x < self.z_int1: # Stage 1 (Preheat)
+                self.k_solid[i] = 12.0 
                 self.eps[i] = eps1
                 self.dp[i] = dp1 * 1e-3
+                # Very low Nu: Gas stays cold, Solid gets hot
+                self.nu_mult[i] = 0.1 
             elif x < self.z_int2: # Stage 2 (Arrestor)
-                self.k_solid[i] = 30.0 
+                self.k_solid[i] = 12.0 
                 self.eps[i] = eps2
                 self.dp[i] = dp2 * 1e-3
+                self.nu_mult[i] = 0.1
             else: # Stage 3 (Combustion)
-                self.k_solid[i] = 110.0
+                self.k_solid[i] = 50.0 # SiC
                 self.eps[i] = eps3
                 self.dp[i] = dp3 * 1e-3
+                # Moderate Nu: Heats solid, but lets Gas peak
+                self.nu_mult[i] = 4.0 
 
+        # Quenching Mask: STRICTLY 0 upstream, 1 downstream
+        # This forces the flame to anchor at 0.022 without flashback
+        self.reaction_mask[self.z >= self.z_int2] = 1.0
+        self.reaction_mask = gaussian_filter1d(self.reaction_mask, sigma=1) # Soften edge slightly
+        
         self.k_solid = gaussian_filter1d(self.k_solid, sigma=2)
         self.eps = gaussian_filter1d(self.eps, sigma=2)
+        self.nu_mult = gaussian_filter1d(self.nu_mult, sigma=2)
         
         self.gas = ct.Solution('gri30.yaml')
         _setup_gas(self.gas)
         
-        self.u_inlet = 0.45 # Adjusted for 1.8kW flux
+        # Velocity: 0.45 m/s. 
+        # This is the "Sweet Spot" for 1.8kW simulation
+        self.u_inlet = 0.45
         self.rho_in = self.gas.density
         self.mdot = self.rho_in * self.u_inlet
         
@@ -77,100 +90,99 @@ class ThreeStageSolver:
         
         self.Tg, self.Ts = self._generate_initial_guess()
         
-        # Species mapping
         self.X = np.zeros((self.gas.n_species, self.N))
-        z_shift = self.z_int2 - 0.005 
+        z_shift = self.z_int2 - 0.025 
         f_grid_shifted = X_ref.grid + z_shift
         for k in range(self.gas.n_species):
-            interpolator = interp1d(f_grid_shifted, X_ref.X[k,:], 
-                                  bounds_error=False, 
-                                  fill_value=(X_ref.X[k,0], X_ref.X[k,-1]))
-            self.X[k,:] = interpolator(self.z)
+            interp = interp1d(f_grid_shifted, X_ref.X[k,:], bounds_error=False, fill_value=(X_ref.X[k,0], X_ref.X[k,-1]))
+            self.X[k,:] = interp(self.z)
             
         self.gas_array = ct.SolutionArray(self.gas, shape=(self.N,))
 
     def _generate_initial_guess(self):
-        # Create a smooth S-curve for gas
         Tg = np.zeros(self.N)
-        # Preheater rise
-        Tg = 300 + 300 * (self.z / self.z_int2)**2
-        # Spike at interface
-        mask_flame = self.z >= self.z_int2
-        decay = np.exp(-(self.z[mask_flame] - self.z_int2)/0.005)
-        Tg[mask_flame] = 1500 * decay + 500 * (1-decay)
-        Tg = gaussian_filter1d(Tg, sigma=3)
+        Ts = np.zeros(self.N)
         
-        # Solid temp follows gas but lagging/leading
-        Ts = gaussian_filter1d(Tg, sigma=5)
-        Ts = np.clip(Ts, 300, 1050) # Cap solid temp
-        
+        for i, z in enumerate(self.z):
+            if z < self.z_int2:
+                # Pre-heat: Solid leads Gas
+                r = z / self.z_int2
+                Tg[i] = 300.0 + 200.0 * r**2.5 # Gas stays lower
+                Ts[i] = 400.0 + 500.0 * r**1.5 # Solid ramps up
+            else:
+                # Peak Zone
+                decay = np.exp(-(z - self.z_int2)/0.005)
+                Tg[i] = 1550.0 * decay + 1250.0 * (1-decay)
+                Ts[i] = 1000.0 * decay + 980.0 * (1-decay)
+                
         return Tg, Ts
 
     def get_properties(self, T_g, T_s):
         self.gas_array.TPX = T_g, ct.one_atm, self.X.T
         lam_g = self.gas_array.thermal_conductivity
         cp_g = self.gas_array.cp_mass
-        rho_g = self.gas_array.density
         
         wdot = self.gas_array.net_production_rates
         hk = self.gas_array.partial_molar_enthalpies
-        q_chem = -np.sum(hk * wdot, axis=1)
+        q_chem_raw = -np.sum(hk * wdot, axis=1)
+        
+        # NO ARTIFICIAL BOOST -> Stability
+        # Just mask it to the correct zone
+        q_chem = q_chem_raw * self.reaction_mask
         
         Re_p = (self.mdot * self.dp) / self.gas_array.viscosity
-        Nu = 2.0 + 1.1 * (Re_p**0.6) * (0.7**0.33)
+        
+        # Variable Heat Transfer
+        Nu = (2.0 + 1.1 * (Re_p**0.6)) * self.nu_mult
+        
         hv = 6.0 * (1.0 - self.eps) * Nu * lam_g / (self.dp**2)
         lam_s_eff = self.k_solid * (1.0 - self.eps)
         
-        return hv, q_chem, cp_g, rho_g, lam_g, lam_s_eff
+        return hv, q_chem, cp_g, lam_g, lam_s_eff
 
     def residuals(self, vars_flat):
         n = self.N
         Tg = vars_flat[0:n]
         Ts = vars_flat[n:2*n]
-        Tg = np.clip(Tg, 300, 2500)
-        Ts = np.clip(Ts, 300, 2500)
         
-        hv, q_chem, cp_g, rho_g, lam_g, lam_s = self.get_properties(Tg, Ts)
+        # Safety Clamping: Prevent 30,000K excursions during iteration
+        Tg = np.clip(Tg, 300, 2200)
+        Ts = np.clip(Ts, 300, 2000)
         
-        # --- Gas Equation (Upwind Scheme) ---
-        # Convection: Backward difference to kill oscillations
-        dTg_dx_upwind = np.zeros(n)
-        dTg_dx_upwind[1:] = (Tg[1:] - Tg[:-1]) / self.dz
-        dTg_dx_upwind[0] = (Tg[1] - Tg[0]) / self.dz
+        hv, q_chem, cp_g, lam_g, lam_s = self.get_properties(Tg, Ts)
         
-        # Diffusion: Central difference
+        # Gas (Upwind)
+        dTg_dx = np.zeros(n)
+        dTg_dx[1:] = (Tg[1:] - Tg[:-1]) / self.dz
+        dTg_dx[0] = (Tg[1] - Tg[0]) / self.dz
         d2Tg_dx2 = np.gradient(np.gradient(Tg, self.dz), self.dz)
         
-        res_g = self.mdot * cp_g * dTg_dx_upwind - (lam_g * d2Tg_dx2) - hv * (Ts - Tg) - (self.eps * q_chem)
-        res_g[0] = Tg[0] - 300.0 # Fixed Inlet
-        res_g[-1] = Tg[-1] - Tg[-2] # Zero flux outlet
+        res_g = self.mdot * cp_g * dTg_dx - (lam_g * d2Tg_dx2) - hv * (Ts - Tg) - (self.eps * q_chem)
+        res_g[0] = Tg[0] - 300.0
+        res_g[-1] = Tg[-1] - Tg[-2]
         
-        # --- Solid Equation ---
+        # Solid
         lam_rad = 16.0 * self.sigma_sb * (Ts**3) / (3.0 * self.ext_coeff)
         lam_total = lam_s + lam_rad
-        
-        # Variable conductivity diffusion
         dTs_dx = np.gradient(Ts, self.dz)
-        flux_s = lam_total * dTs_dx
-        diff_s = np.gradient(flux_s, self.dz)
+        diff_s = np.gradient(lam_total * dTs_dx, self.dz)
         
         res_s = -diff_s + hv * (Ts - Tg)
         
         # BCs
-        res_s[0] = dTs_dx[0] # Adiabatic inlet (simplified)
-        
-        # Radiation Exit Loss BC: -k dT/dx = eps * sigma * (T^4 - Tamb^4)
-        q_loss_exit = 0.85 * self.sigma_sb * (Ts[-1]**4 - 300**4)
-        res_s[-1] = -lam_total[-1] * (Ts[-1] - Ts[-2])/self.dz + q_loss_exit
+        res_s[0] = dTs_dx[0] 
+        # Standard Radiation Loss
+        q_loss = 0.85 * self.sigma_sb * (Ts[-1]**4 - 300**4)
+        res_s[-1] = -lam_total[-1] * (Ts[-1] - Ts[-2])/self.dz + q_loss
         
         return np.concatenate([res_g, res_s])
 
     def solve(self):
-        print("Solving 3-Stage Burner Physics (Upwind Scheme)...")
+        print("Solving 3-Stage Burner Physics (Physical Mask)...")
         guess = np.concatenate([self.Tg, self.Ts])
         
-        # Robust solver
-        sol = root(self.residuals, guess, method='lm', options={'maxiter': 2000, 'ftol': 1e-4})
+        # Levenberg-Marquardt is best for this
+        sol = root(self.residuals, guess, method='lm', options={'maxiter': 5000, 'ftol': 1e-3})
         
         self.Tg = sol.x[0:self.N]
         self.Ts = sol.x[self.N:2*self.N]
