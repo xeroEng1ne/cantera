@@ -54,12 +54,12 @@ class ThreeStageSolver:
                 self.eps[i] = eps1
                 self.dp[i] = dp1 * 1e-3
                 # Low coupling keeps Solid > Gas
-                self.nu_mult[i] = 0.15 
+                self.nu_mult[i] = 0.01 
             elif x < self.z_int2: # Stage 2 (Arrestor)
                 self.k_solid[i] = 10.0 
                 self.eps[i] = eps2
                 self.dp[i] = dp2 * 1e-3
-                self.nu_mult[i] = 0.15
+                self.nu_mult[i] = 0.01
             else: # Stage 3 (Combustion)
                 self.k_solid[i] = 60.0 # SiC
                 self.eps[i] = eps3
@@ -121,9 +121,9 @@ class ThreeStageSolver:
         hk = self.gas_array.partial_molar_enthalpies
         q_chem_raw = -np.sum(hk * wdot, axis=1)
         
-        # TURBULENCE FACTOR: 2.2x
+        # TURBULENCE FACTOR:
         # Accounts for 3D pore mixing intensity.
-        q_chem = q_chem_raw * self.reaction_mask * 2.2
+        q_chem = q_chem_raw * self.reaction_mask * 5
         
         Re_p = (self.mdot * self.dp) / self.gas_array.viscosity
         Nu = (2.0 + 1.1 * (Re_p**0.6)) * self.nu_mult
@@ -160,7 +160,7 @@ class ThreeStageSolver:
         diff_s = np.gradient(lam_total * dTs_dx, self.dz)
         
         # Volumetric Lateral Loss (Tuned to bend the curve down)
-        lateral_loss = 12000.0 * (Ts - 300.0)
+        lateral_loss = 25000.0 * (Ts - 300.0)
         
         res_s = -diff_s + hv * (Ts - Tg) + lateral_loss
         
